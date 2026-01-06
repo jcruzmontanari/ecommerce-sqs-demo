@@ -1,0 +1,27 @@
+{
+  "name": "ecommerce-sqs-demo",
+  "version": "1.0.0",
+  "description": "E-commerce event-driven architecture demo using AWS SQS",
+  "main": "dist/demo.js",
+  "scripts": {
+    "build": "tsc",
+    "demo": "npx tsx src/demo.ts",
+    "demo:localstack": "USE_LOCALSTACK=true npx tsx src/demo.ts",
+    "demo:aws": "npx tsx src/demo.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["aws", "sqs", "ecommerce", "event-driven", "microservices"],
+  "author": "Juan Cruz",
+  "license": "MIT",
+  "type": "module",
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.964.0",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.3",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.3"
+  }
+}
