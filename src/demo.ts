@@ -35,8 +35,16 @@ import { InventoryService } from './services/inventory-service.js';
 import { NotificationService } from './services/notification-service.js';
 import { DLQHandler } from './services/dlq-handler.js';
 import { createLogger } from './utils/logger.js';
+import {
+  getMetrics,
+  getTracer,
+  printDashboardSummary,
+  METRIC_NAMES,
+} from './observability/index.js';
 
 const logger = createLogger('Demo');
+const metrics = getMetrics();
+const tracer = getTracer();
 
 // Sample order data
 const SAMPLE_ORDERS: CreateOrderRequest[] = [
@@ -242,6 +250,43 @@ async function runDemo(): Promise<void> {
 
     // Print DLQ summary
     dlqHandler.printSummary();
+
+    // Print DataDog observability summary
+    printDashboardSummary();
+
+    // Print metrics summary
+    const metricsBuffer = metrics.flush();
+    console.log('\n┌────────────────────────────────────────────────────────────┐');
+    console.log('│           DATADOG METRICS SUMMARY                          │');
+    console.log('├────────────────────────────────────────────────────────────┤');
+    console.log(`│ Total Metrics Recorded: ${String(metricsBuffer.length).padEnd(34)} │`);
+
+    // Group metrics by name
+    const metricCounts: Record<string, number> = {};
+    for (const m of metricsBuffer) {
+      metricCounts[m.name] = (metricCounts[m.name] || 0) + 1;
+    }
+    for (const [name, count] of Object.entries(metricCounts).slice(0, 8)) {
+      console.log(`│   ${name.substring(0, 40).padEnd(40)} ${String(count).padStart(5)} │`);
+    }
+    console.log('└────────────────────────────────────────────────────────────┘\n');
+
+    // Print trace summary
+    const completedSpans = tracer.getCompletedSpans();
+    console.log('┌────────────────────────────────────────────────────────────┐');
+    console.log('│           DATADOG APM TRACE SUMMARY                        │');
+    console.log('├────────────────────────────────────────────────────────────┤');
+    console.log(`│ Total Spans Recorded: ${String(completedSpans.length).padEnd(36)} │`);
+
+    // Group spans by operation
+    const spanCounts: Record<string, number> = {};
+    for (const s of completedSpans) {
+      spanCounts[s.operationName] = (spanCounts[s.operationName] || 0) + 1;
+    }
+    for (const [name, count] of Object.entries(spanCounts).slice(0, 6)) {
+      console.log(`│   ${name.substring(0, 40).padEnd(40)} ${String(count).padStart(5)} │`);
+    }
+    console.log('└────────────────────────────────────────────────────────────┘\n');
 
     // Step 7: Cleanup
     logger.info('Step 7: Stopping services...');

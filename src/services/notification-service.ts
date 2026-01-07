@@ -14,10 +14,15 @@
  * - Template pattern for different notification types
  * - Deduplication for preventing spam
  * - Rate limiting per customer
+ *
+ * DataDog Integration:
+ * - Metrics: notifications sent, failed, by type/channel
+ * - Tracing: spans for email sending
  */
 
 import { v4 as uuidv4 } from 'uuid';
 import { BaseConsumer, type ConsumerConfig } from './base-consumer.js';
+import { METRIC_NAMES, type Span } from '../observability/index.js';
 import type { NotificationEvent } from '../types/index.js';
 
 interface NotificationServiceConfig extends Omit<ConsumerConfig, 'queueName'> {}
@@ -32,7 +37,7 @@ interface SentNotification {
 }
 
 // Email templates (simplified)
-const EMAIL_TEMPLATES = {
+const EMAIL_TEMPLATES: Record<string, { subject: string; body: string }> = {
   order_confirmation: {
     subject: 'Order Confirmed - #{orderNumber}',
     body: `
@@ -101,9 +106,15 @@ export class NotificationService extends BaseConsumer<NotificationEvent> {
 
   protected async processMessage(
     event: NotificationEvent,
-    correlationId: string
+    correlationId: string,
+    parentSpan: Span
   ): Promise<void> {
     const { orderId, customerId, customerEmail, notificationType, templateData } = event.payload;
+
+    // Add notification-specific tags to the span
+    parentSpan.tags['notification.order_id'] = orderId;
+    parentSpan.tags['notification.type'] = notificationType;
+    parentSpan.tags['notification.channel'] = 'email';
 
     this.logger.info('Processing notification', {
       orderId,
@@ -117,12 +128,16 @@ export class NotificationService extends BaseConsumer<NotificationEvent> {
         customerId,
         correlationId,
       });
+      parentSpan.tags['notification.status'] = 'rate_limited';
+      this.metrics.increment(METRIC_NAMES.NOTIFICATIONS_FAILED, 1, {
+        type: notificationType,
+        reason: 'rate_limited',
+      });
       // Don't throw - just skip this notification
       return;
     }
 
     // Deduplication: check if we've already sent this exact notification
-    const dedupeKey = `${orderId}:${notificationType}`;
     const alreadySent = this.sentNotifications.some(
       (n) => n.orderId === orderId && n.type === notificationType
     );
@@ -133,6 +148,7 @@ export class NotificationService extends BaseConsumer<NotificationEvent> {
         notificationType,
         correlationId,
       });
+      parentSpan.tags['notification.status'] = 'duplicate';
       return;
     }
 
@@ -143,11 +159,26 @@ export class NotificationService extends BaseConsumer<NotificationEvent> {
         notificationType,
         correlationId,
       });
+      parentSpan.tags['notification.status'] = 'invalid_type';
+      this.metrics.increment(METRIC_NAMES.NOTIFICATIONS_FAILED, 1, {
+        type: notificationType,
+        reason: 'invalid_type',
+      });
       return;
     }
 
     const renderedSubject = this.renderTemplate(template.subject, templateData);
     const renderedBody = this.renderTemplate(template.body, templateData);
+
+    // Create child span for email sending
+    const emailSpan = this.tracer.createChildSpan(parentSpan, 'notification.send_email', {
+      resourceName: notificationType,
+      tags: {
+        'span.kind': 'client',
+        'email.to': customerEmail || 'customer@example.com',
+        'email.template': notificationType,
+      },
+    });
 
     // Simulate sending email
     await this.sendEmail({
@@ -155,6 +186,8 @@ export class NotificationService extends BaseConsumer<NotificationEvent> {
       subject: renderedSubject,
       body: renderedBody,
     });
+
+    this.tracer.finishSpan(emailSpan);
 
     // Track sent notification
     const notification: SentNotification = {
@@ -167,9 +200,17 @@ export class NotificationService extends BaseConsumer<NotificationEvent> {
     };
 
     this.sentNotifications.push(notification);
+    parentSpan.tags['notification.status'] = 'sent';
+    parentSpan.tags['notification.id'] = notification.notificationId;
 
     // Update rate limit counter
     this.incrementRateLimit(customerId);
+
+    // Record success metrics
+    this.metrics.increment(METRIC_NAMES.NOTIFICATIONS_SENT, 1, {
+      type: notificationType,
+      channel: 'email',
+    });
 
     this.logger.info('Notification sent', {
       notificationId: notification.notificationId,
@@ -177,11 +218,6 @@ export class NotificationService extends BaseConsumer<NotificationEvent> {
       notificationType,
       channel: 'email',
       correlationId,
-    });
-
-    this.logger.metric('notifications.sent', 1, {
-      type: notificationType,
-      channel: 'email',
     });
   }
 
@@ -217,7 +253,7 @@ export class NotificationService extends BaseConsumer<NotificationEvent> {
     });
 
     console.log('\n┌────────────────────────────────────────────────────────────┐');
-    console.log('│ 📧 EMAIL SENT (Simulated)                                  │');
+    console.log('│ EMAIL SENT (Simulated)                                     │');
     console.log('├────────────────────────────────────────────────────────────┤');
     console.log(`│ To:      ${params.to.padEnd(50)} │`);
     console.log(`│ Subject: ${params.subject.substring(0, 50).padEnd(50)} │`);

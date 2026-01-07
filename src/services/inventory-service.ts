@@ -14,11 +14,16 @@
  * - Saga pattern participant (compensating transactions)
  * - Optimistic locking for concurrent reservations
  * - Event sourcing for stock movements
+ *
+ * DataDog Integration:
+ * - Metrics: reservations, stock levels, failures
+ * - Tracing: spans for reservation attempts
  */
 
 import { v4 as uuidv4 } from 'uuid';
 import { BaseConsumer, type ConsumerConfig } from './base-consumer.js';
 import { sendMessage } from '../queues/sqs-client.js';
+import { METRIC_NAMES, type Span } from '../observability/index.js';
 import type {
   InventoryReserveEvent,
   InventoryResultEvent,
@@ -72,6 +77,11 @@ export class InventoryService extends BaseConsumer<InventoryReserveEvent> {
 
     for (const product of products) {
       this.inventory.set(product.productId, product);
+      // Record initial stock levels
+      this.metrics.gauge(METRIC_NAMES.INVENTORY_STOCK_LEVEL, product.available, {
+        product_id: product.productId,
+        sku: product.sku,
+      });
     }
 
     this.logger.info('Inventory initialized', { productCount: products.length });
@@ -79,9 +89,14 @@ export class InventoryService extends BaseConsumer<InventoryReserveEvent> {
 
   protected async processMessage(
     event: InventoryReserveEvent,
-    correlationId: string
+    correlationId: string,
+    parentSpan: Span
   ): Promise<void> {
     const { orderId, items } = event.payload;
+
+    // Add inventory-specific tags to the span
+    parentSpan.tags['inventory.order_id'] = orderId;
+    parentSpan.tags['inventory.item_count'] = items.length;
 
     this.logger.info('Processing inventory reservation', {
       orderId,
@@ -100,11 +115,22 @@ export class InventoryService extends BaseConsumer<InventoryReserveEvent> {
         reservationId: existingReservation.reservationId,
         correlationId,
       });
+      parentSpan.tags['inventory.status'] = 'duplicate';
       return;
     }
 
+    // Create child span for reservation attempt
+    const reservationSpan = this.tracer.createChildSpan(parentSpan, 'inventory.attempt_reservation', {
+      resourceName: orderId,
+      tags: {
+        'inventory.items_requested': items.length,
+      },
+    });
+
     // Attempt to reserve all items
     const reservationResult = this.attemptReservation(orderId, items);
+
+    this.tracer.finishSpan(reservationSpan);
 
     if (reservationResult.success) {
       const reservation: Reservation = {
@@ -116,23 +142,24 @@ export class InventoryService extends BaseConsumer<InventoryReserveEvent> {
       };
 
       this.reservations.set(reservation.reservationId, reservation);
+      parentSpan.tags['inventory.status'] = 'reserved';
+      parentSpan.tags['inventory.reservation_id'] = reservation.reservationId;
 
-      // Emit success event
-      const successEvent: InventoryResultEvent = {
-        eventId: uuidv4(),
-        correlationId,
-        timestamp: new Date().toISOString(),
-        version: '1.0',
-        type: 'INVENTORY_RESERVED',
-        payload: {
-          orderId,
-          reservationId: reservation.reservationId,
-          items: items.map((item) => ({
-            ...item,
-            reserved: true,
-          })),
-        },
-      };
+      // Record success metrics
+      this.metrics.increment(METRIC_NAMES.INVENTORY_RESERVED, 1, {
+        status: 'success',
+      });
+
+      // Update stock level gauges
+      for (const item of items) {
+        const stock = this.inventory.get(item.productId);
+        if (stock) {
+          this.metrics.gauge(METRIC_NAMES.INVENTORY_STOCK_LEVEL, stock.available - stock.reserved, {
+            product_id: item.productId,
+            type: 'available',
+          });
+        }
+      }
 
       this.logger.info('Inventory reserved successfully', {
         orderId,
@@ -140,30 +167,20 @@ export class InventoryService extends BaseConsumer<InventoryReserveEvent> {
         correlationId,
       });
 
-      this.logger.metric('inventory.reserved', 1, { status: 'success' });
-
     } else {
-      // Emit failure event
-      const failureEvent: InventoryResultEvent = {
-        eventId: uuidv4(),
-        correlationId,
-        timestamp: new Date().toISOString(),
-        version: '1.0',
-        type: 'INVENTORY_FAILED',
-        payload: {
-          orderId,
-          items: reservationResult.itemResults!,
-          failureReason: reservationResult.error,
-        },
-      };
+      parentSpan.tags['inventory.status'] = 'failed';
+      parentSpan.tags['inventory.failure_reason'] = reservationResult.error;
+
+      // Record failure metrics
+      this.metrics.increment(METRIC_NAMES.INVENTORY_FAILED, 1, {
+        reason: 'insufficient_stock',
+      });
 
       this.logger.warn('Inventory reservation failed', {
         orderId,
         reason: reservationResult.error,
         correlationId,
       });
-
-      this.logger.metric('inventory.failed', 1, { reason: 'insufficient_stock' });
 
       // Send notification about inventory issue
       const notificationEvent: NotificationEvent = {
@@ -185,10 +202,10 @@ export class InventoryService extends BaseConsumer<InventoryReserveEvent> {
       };
 
       await sendMessage(this.notificationsQueueUrl, notificationEvent, {
-        messageAttributes: {
+        messageAttributes: this.tracer.injectToSQSMessage(parentSpan, {
           EventType: { DataType: 'String', StringValue: 'NOTIFICATION_REQUESTED' },
           CorrelationId: { DataType: 'String', StringValue: correlationId },
-        },
+        }),
       });
     }
   }
@@ -285,6 +302,11 @@ export class InventoryService extends BaseConsumer<InventoryReserveEvent> {
       const stock = this.inventory.get(item.productId);
       if (stock) {
         stock.reserved = Math.max(0, stock.reserved - item.quantity);
+        // Update stock gauge
+        this.metrics.gauge(METRIC_NAMES.INVENTORY_STOCK_LEVEL, stock.available - stock.reserved, {
+          product_id: item.productId,
+          type: 'available',
+        });
       }
     }
 

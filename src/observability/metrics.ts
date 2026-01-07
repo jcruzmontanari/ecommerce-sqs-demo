@@ -86,11 +86,13 @@ class DataDogMetrics {
   private isEnabled: boolean;
   private flushInterval: NodeJS.Timeout | null = null;
 
-  constructor(options: {
-    prefix?: string;
-    defaultTags?: MetricTags;
-    enabled?: boolean;
-  } = {}) {
+  constructor(
+    options: {
+      prefix?: string;
+      defaultTags?: MetricTags;
+      enabled?: boolean;
+    } = {},
+  ) {
     this.prefix = options.prefix || 'ecommerce';
     this.defaultTags = {
       env: process.env.DD_ENV || 'development',
@@ -98,7 +100,7 @@ class DataDogMetrics {
       version: process.env.DD_VERSION || '1.0.0',
       ...options.defaultTags,
     };
-    this.isEnabled = options.enabled ?? (process.env.DD_ENABLED === 'true');
+    this.isEnabled = options.enabled ?? process.env.DD_ENABLED === 'true';
 
     if (this.isEnabled) {
       // In production, this would connect to DataDog agent
@@ -169,7 +171,7 @@ class DataDogMetrics {
   async time<T>(
     name: string,
     fn: () => Promise<T>,
-    tags: MetricTags = {}
+    tags: MetricTags = {},
   ): Promise<T> {
     const start = Date.now();
     try {
@@ -217,7 +219,9 @@ class DataDogMetrics {
     }[metric.type];
 
     console.log(
-      `\x1b[35m[METRIC]\x1b[0m ${symbol} ${metric.name} = ${metric.value} ${tagStr ? `{${tagStr}}` : ''}`
+      `\x1b[35m[METRIC]\x1b[0m ${symbol} ${metric.name} = ${metric.value} ${
+        tagStr ? `{${tagStr}}` : ''
+      }`,
     );
   }
 
@@ -268,7 +272,9 @@ class DataDogMetrics {
 // Singleton instance
 let metricsInstance: DataDogMetrics | null = null;
 
-export function getMetrics(options?: ConstructorParameters<typeof DataDogMetrics>[0]): DataDogMetrics {
+export function getMetrics(
+  options?: ConstructorParameters<typeof DataDogMetrics>[0],
+): DataDogMetrics {
   if (!metricsInstance) {
     metricsInstance = new DataDogMetrics(options);
   }

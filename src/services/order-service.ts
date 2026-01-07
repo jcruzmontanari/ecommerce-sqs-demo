@@ -10,20 +10,26 @@
  * Event Flow:
  * [API] → OrderService.createOrder() → Orders Queue → PaymentService
  *                                    → Notifications Queue
+ *
+ * DataDog Integration:
+ * - Metrics: orders created, order value, item count
+ * - Tracing: spans for order creation and message publishing
  */
 
 import { v4 as uuidv4 } from 'uuid';
 import { sendMessage } from '../queues/sqs-client.js';
 import { createLogger } from '../utils/logger.js';
+import { getMetrics, getTracer, METRIC_NAMES } from '../observability/index.js';
 import type {
   Order,
-  OrderItem,
   OrderCreatedEvent,
   PaymentRequestEvent,
   NotificationEvent,
 } from '../types/index.js';
 
 const logger = createLogger('OrderService');
+const metrics = getMetrics();
+const tracer = getTracer();
 
 export interface CreateOrderRequest {
   customerId: string;
@@ -66,115 +72,173 @@ export class OrderService {
     const orderId = `ORD-${uuidv4().substring(0, 8).toUpperCase()}`;
     const correlationId = uuidv4();
     const timestamp = new Date().toISOString();
+    const startTime = Date.now();
 
-    logger.info('Creating new order', {
-      orderId,
-      correlationId,
-      customerId: request.customerId,
-      itemCount: request.items.length,
-    });
-
-    // Validate order
-    this.validateOrder(request);
-
-    // Calculate total
-    const totalAmount = request.items.reduce(
-      (sum, item) => sum + item.unitPrice * item.quantity,
-      0
-    );
-
-    // Build order object
-    const order: Order = {
-      orderId,
-      customerId: request.customerId,
-      customerEmail: request.customerEmail,
-      items: request.items,
-      totalAmount,
-      currency: 'USD',
-      shippingAddress: request.shippingAddress,
-      status: 'pending',
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    };
-
-    // 1. Emit OrderCreated event to Orders queue
-    const orderCreatedEvent: OrderCreatedEvent = {
-      eventId: uuidv4(),
-      correlationId,
-      timestamp,
-      version: '1.0',
-      type: 'ORDER_CREATED',
-      payload: order,
-    };
-
-    await sendMessage(this.config.ordersQueueUrl, orderCreatedEvent, {
-      messageAttributes: {
-        EventType: { DataType: 'String', StringValue: 'ORDER_CREATED' },
-        CorrelationId: { DataType: 'String', StringValue: correlationId },
+    // Start a span for order creation
+    const span = tracer.startSpan('order.create', {
+      resourceName: orderId,
+      tags: {
+        'order.id': orderId,
+        'order.customer_id': request.customerId,
+        'order.items_count': request.items.length,
+        'order.payment_method': request.paymentMethod,
+        'correlation_id': correlationId,
       },
     });
 
-    logger.info('OrderCreated event emitted', { orderId, correlationId });
-
-    // 2. Emit PaymentRequested event to Payments queue
-    const paymentEvent: PaymentRequestEvent = {
-      eventId: uuidv4(),
-      correlationId,
-      timestamp,
-      version: '1.0',
-      type: 'PAYMENT_REQUESTED',
-      payload: {
+    try {
+      logger.info('Creating new order', {
         orderId,
+        correlationId,
         customerId: request.customerId,
-        amount: totalAmount,
-        currency: 'USD',
-        paymentMethod: request.paymentMethod,
-      },
-    };
+        itemCount: request.items.length,
+      });
 
-    await sendMessage(this.config.paymentsQueueUrl, paymentEvent, {
-      messageAttributes: {
-        EventType: { DataType: 'String', StringValue: 'PAYMENT_REQUESTED' },
-        CorrelationId: { DataType: 'String', StringValue: correlationId },
-      },
-    });
+      // Validate order
+      this.validateOrder(request);
 
-    logger.info('PaymentRequested event emitted', { orderId, correlationId });
+      // Calculate total
+      const totalAmount = request.items.reduce(
+        (sum, item) => sum + item.unitPrice * item.quantity,
+        0
+      );
 
-    // 3. Emit notification for order confirmation email
-    const notificationEvent: NotificationEvent = {
-      eventId: uuidv4(),
-      correlationId,
-      timestamp,
-      version: '1.0',
-      type: 'NOTIFICATION_REQUESTED',
-      payload: {
+      span.tags['order.total_amount'] = totalAmount;
+      span.tags['order.currency'] = 'USD';
+
+      // Build order object
+      const order: Order = {
         orderId,
         customerId: request.customerId,
         customerEmail: request.customerEmail,
-        notificationType: 'order_confirmation',
-        templateData: {
-          orderNumber: orderId,
-          items: request.items,
-          totalAmount,
-          shippingAddress: request.shippingAddress,
-        },
-      },
-    };
+        items: request.items,
+        totalAmount,
+        currency: 'USD',
+        shippingAddress: request.shippingAddress,
+        status: 'pending',
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
 
-    await sendMessage(this.config.notificationsQueueUrl, notificationEvent, {
-      messageAttributes: {
-        EventType: { DataType: 'String', StringValue: 'NOTIFICATION_REQUESTED' },
+      // Create child span for message publishing
+      const publishSpan = tracer.createChildSpan(span, 'order.publish_events', {
+        tags: { 'messaging.operation': 'publish' },
+      });
+
+      // Inject trace context for distributed tracing
+      const traceAttributes = tracer.injectToSQSMessage(span, {
         CorrelationId: { DataType: 'String', StringValue: correlationId },
-      },
-    });
+      });
 
-    logger.info('Order confirmation notification queued', { orderId, correlationId });
+      // 1. Emit OrderCreated event to Orders queue
+      const orderCreatedEvent: OrderCreatedEvent = {
+        eventId: uuidv4(),
+        correlationId,
+        timestamp,
+        version: '1.0',
+        type: 'ORDER_CREATED',
+        payload: order,
+      };
 
-    logger.metric('orders.created', 1, { status: 'success' });
-    logger.metric('orders.value', totalAmount, { currency: 'USD' });
+      await sendMessage(this.config.ordersQueueUrl, orderCreatedEvent, {
+        messageAttributes: {
+          ...traceAttributes,
+          EventType: { DataType: 'String', StringValue: 'ORDER_CREATED' },
+        },
+      });
 
-    return order;
+      logger.info('OrderCreated event emitted', { orderId, correlationId });
+
+      // 2. Emit PaymentRequested event to Payments queue
+      const paymentEvent: PaymentRequestEvent = {
+        eventId: uuidv4(),
+        correlationId,
+        timestamp,
+        version: '1.0',
+        type: 'PAYMENT_REQUESTED',
+        payload: {
+          orderId,
+          customerId: request.customerId,
+          amount: totalAmount,
+          currency: 'USD',
+          paymentMethod: request.paymentMethod,
+        },
+      };
+
+      await sendMessage(this.config.paymentsQueueUrl, paymentEvent, {
+        messageAttributes: {
+          ...traceAttributes,
+          EventType: { DataType: 'String', StringValue: 'PAYMENT_REQUESTED' },
+        },
+      });
+
+      logger.info('PaymentRequested event emitted', { orderId, correlationId });
+
+      // 3. Emit notification for order confirmation email
+      const notificationEvent: NotificationEvent = {
+        eventId: uuidv4(),
+        correlationId,
+        timestamp,
+        version: '1.0',
+        type: 'NOTIFICATION_REQUESTED',
+        payload: {
+          orderId,
+          customerId: request.customerId,
+          customerEmail: request.customerEmail,
+          notificationType: 'order_confirmation',
+          templateData: {
+            orderNumber: orderId,
+            items: request.items,
+            totalAmount,
+            shippingAddress: request.shippingAddress,
+          },
+        },
+      };
+
+      await sendMessage(this.config.notificationsQueueUrl, notificationEvent, {
+        messageAttributes: {
+          ...traceAttributes,
+          EventType: { DataType: 'String', StringValue: 'NOTIFICATION_REQUESTED' },
+        },
+      });
+
+      logger.info('Order confirmation notification queued', { orderId, correlationId });
+
+      tracer.finishSpan(publishSpan);
+
+      // Record DataDog metrics
+      metrics.increment(METRIC_NAMES.ORDERS_CREATED, 1, {
+        payment_method: request.paymentMethod,
+        status: 'success',
+      });
+      metrics.distribution(METRIC_NAMES.ORDERS_VALUE, totalAmount, {
+        currency: 'USD',
+      });
+      metrics.histogram(METRIC_NAMES.ORDERS_ITEMS_COUNT, request.items.length, {});
+      metrics.histogram(METRIC_NAMES.ORDERS_PROCESSING_TIME, Date.now() - startTime, {
+        status: 'success',
+      });
+
+      span.tags['order.status'] = 'created';
+      tracer.finishSpan(span);
+
+      return order;
+
+    } catch (error) {
+      // Record error metrics
+      metrics.increment(METRIC_NAMES.ORDERS_CREATED, 1, {
+        status: 'failed',
+      });
+      metrics.increment(METRIC_NAMES.SERVICE_ERRORS, 1, {
+        service: 'OrderService',
+        error_type: error instanceof Error ? error.name : 'UnknownError',
+      });
+
+      span.tags['order.status'] = 'failed';
+      tracer.finishSpan(span, error as Error);
+
+      throw error;
+    }
   }
 
   /**
